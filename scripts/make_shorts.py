@@ -29,11 +29,14 @@ YOUTUBE_COOKIES_FILE = os.environ.get(
     ""
 ).strip()
 
-# Optional.
-# If empty, the script automatically discovers a usable Gemini model.
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
     ""
+).strip()
+
+WHISPER_MODEL = os.environ.get(
+    "WHISPER_MODEL",
+    "small"
 ).strip()
 
 
@@ -250,6 +253,105 @@ def transcript_for_prompt(
 
 
 # =========================================================
+# WHISPER FALLBACK
+# =========================================================
+
+def transcribe_with_whisper(video_path):
+
+    print(
+        "\n"
+        "===== WHISPER FALLBACK ====="
+        "\n"
+    )
+
+    audio_path = WORK / "audio.wav"
+
+    run(
+        [
+            "ffmpeg",
+            "-y",
+
+            "-i",
+            str(video_path),
+
+            "-vn",
+
+            "-ac",
+            "1",
+
+            "-ar",
+            "16000",
+
+            "-c:a",
+            "pcm_s16le",
+
+            str(audio_path)
+        ]
+    )
+
+    print(
+        f"\nLoading Whisper model: "
+        f"{WHISPER_MODEL}\n"
+    )
+
+    from faster_whisper import WhisperModel
+
+    model = WhisperModel(
+        WHISPER_MODEL,
+        device="cpu",
+        compute_type="int8"
+    )
+
+    segments, info = model.transcribe(
+        str(audio_path),
+        beam_size=5,
+        vad_filter=True
+    )
+
+    print(
+        f"Detected language: "
+        f"{info.language}"
+    )
+
+    cues = []
+
+    for segment in segments:
+
+        text = (
+            segment.text
+            or ""
+        ).strip()
+
+        if not text:
+            continue
+
+        cues.append(
+            {
+                "start": float(
+                    segment.start
+                ),
+                "end": float(
+                    segment.end
+                ),
+                "text": text
+            }
+        )
+
+    if not cues:
+
+        raise RuntimeError(
+            "Whisper did not produce any transcript."
+        )
+
+    print(
+        f"Whisper segments: "
+        f"{len(cues)}"
+    )
+
+    return cues
+
+
+# =========================================================
 # GEMINI
 # =========================================================
 
@@ -344,8 +446,6 @@ def get_available_gemini_model():
     for name in available:
         print(" -", name)
 
-    # Try to prefer Flash / Flash-Lite models,
-    # without depending on a specific model version.
     preferred = []
 
     for name in available:
@@ -577,7 +677,6 @@ def normalize_clips(
         except Exception:
             continue
 
-        # Hard limits
         duration = min(
             45.0,
             max(
@@ -631,7 +730,6 @@ def normalize_clips(
             if intersection > 5.0:
 
                 overlap = True
-
                 break
 
         if overlap:
@@ -831,7 +929,7 @@ print(
 
 
 # =========================================================
-# 2. DOWNLOAD CAPTIONS
+# 2. TRY YOUTUBE CAPTIONS
 # =========================================================
 
 print(
@@ -841,30 +939,42 @@ print(
 )
 
 
-run(
-    YT_COMMON
-    + [
-        "--skip-download",
+subtitle_download_failed = False
 
-        "--write-subs",
+try:
 
-        "--write-auto-subs",
+    run(
+        YT_COMMON
+        + [
+            "--skip-download",
 
-        "--sub-format",
-        "vtt",
+            "--write-subs",
 
-        "--sub-langs",
-        "ar.*,en.*",
+            "--write-auto-subs",
 
-        "-o",
-        str(
-            WORK
-            / "subs.%(ext)s"
-        ),
+            "--sub-format",
+            "vtt",
 
-        YOUTUBE_URL
-    ]
-)
+            "--sub-langs",
+            "ar.*,en.*",
+
+            "-o",
+            str(
+                WORK
+                / "subs.%(ext)s"
+            ),
+
+            YOUTUBE_URL
+        ]
+    )
+
+except subprocess.CalledProcessError:
+
+    subtitle_download_failed = True
+
+    print(
+        "\nSubtitle download command failed."
+    )
 
 
 vtt_files = sorted(
@@ -874,69 +984,95 @@ vtt_files = sorted(
 )
 
 
-if not vtt_files:
+# =========================================================
+# 3. GET TRANSCRIPT
+# =========================================================
 
-    raise RuntimeError(
-        "No Arabic or English "
-        "YouTube captions were found."
+if vtt_files:
+
+    print(
+        "\nYouTube captions found."
+    )
+
+    arabic_files = [
+        path
+
+        for path
+        in vtt_files
+
+        if (
+            ".ar"
+            in path.name.lower()
+        )
+    ]
+
+
+    if arabic_files:
+
+        subtitle_path = (
+            arabic_files[0]
+        )
+
+    else:
+
+        subtitle_path = (
+            vtt_files[0]
+        )
+
+
+    print(
+        f"\nUsing subtitles: "
+        f"{subtitle_path}\n"
     )
 
 
-arabic_files = [
-    path
-
-    for path
-    in vtt_files
-
-    if (
-        ".ar"
-        in path.name.lower()
+    subtitle_text = (
+        subtitle_path.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
     )
-]
 
 
-if arabic_files:
-
-    subtitle_path = (
-        arabic_files[0]
+    cues = clean_vtt(
+        subtitle_text
     )
+
+
+    if not cues:
+
+        print(
+            "\nYouTube captions could not be parsed."
+        )
+
+        cues = transcribe_with_whisper(
+            video_path
+        )
 
 else:
 
-    subtitle_path = (
-        vtt_files[0]
+    print(
+        "\nNo usable YouTube captions found."
     )
 
-
-print(
-    f"\nUsing subtitles: "
-    f"{subtitle_path}\n"
-)
-
-
-subtitle_text = (
-    subtitle_path.read_text(
-        encoding="utf-8",
-        errors="ignore"
+    print(
+        "Using Whisper transcription instead."
     )
-)
 
-
-cues = clean_vtt(
-    subtitle_text
-)
+    cues = transcribe_with_whisper(
+        video_path
+    )
 
 
 if not cues:
 
     raise RuntimeError(
-        "Subtitle file exists, "
-        "but could not be parsed."
+        "No transcript could be generated."
     )
 
 
 print(
-    f"Parsed subtitle cues: "
+    f"\nTranscript cues: "
     f"{len(cues)}"
 )
 
@@ -949,7 +1085,7 @@ transcript = (
 
 
 # =========================================================
-# 3. VIDEO DURATION
+# 4. VIDEO DURATION
 # =========================================================
 
 print(
@@ -995,7 +1131,7 @@ print(
 
 
 # =========================================================
-# 4. GEMINI SELECTS CLIPS
+# 5. GEMINI SELECTS CLIPS
 # =========================================================
 
 print(
@@ -1118,7 +1254,7 @@ print(
 
 
 # =========================================================
-# 5. RENDER SHORTS
+# 6. RENDER SHORTS
 # =========================================================
 
 print(
@@ -1134,6 +1270,9 @@ manifest = {
 
     "model":
         SELECTED_GEMINI_MODEL,
+
+    "whisper_model":
+        WHISPER_MODEL,
 
     "clips":
         []
@@ -1176,10 +1315,6 @@ for (
         clip["duration"]
     )
 
-
-    # MVP:
-    # Center crop to 9:16.
-    # Face tracking will be added later.
 
     video_filter = (
         "scale="
