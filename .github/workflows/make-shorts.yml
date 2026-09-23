@@ -88,7 +88,7 @@ jobs:
           CLIPS_COUNT: ${{ steps.vars.outputs.clips_count }}
           YOUTUBE_COOKIES_FILE: ${{ github.workspace }}/cookies.txt
           GEMINI_MODEL: gemini-3.5-flash-lite
-       run: |
+        run: |
           python3 scripts/make_shorts.py
       - name: Delete cookies
         if: always()
