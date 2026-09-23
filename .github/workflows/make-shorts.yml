@@ -1,0 +1,69 @@
+name: Make Shorts
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: "YouTube video URL"
+        required: true
+        type: string
+      clips_count:
+        description: "Number of shorts"
+        required: false
+        default: "3"
+        type: string
+
+  repository_dispatch:
+    types: [make_shorts]
+
+jobs:
+  build-shorts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set inputs
+        id: vars
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "youtube_url=${{ github.event.client_payload.youtube_url }}" >> "$GITHUB_OUTPUT"
+            echo "clips_count=${{ github.event.client_payload.clips_count || '3' }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "youtube_url=${{ inputs.youtube_url }}" >> "$GITHUB_OUTPUT"
+            echo "clips_count=${{ inputs.clips_count }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install yt-dlp
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade yt-dlp
+
+      - name: Create shorts
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YOUTUBE_URL: ${{ steps.vars.outputs.youtube_url }}
+          CLIPS_COUNT: ${{ steps.vars.outputs.clips_count }}
+        run: |
+          python scripts/make_shorts.py
+
+      - name: Upload rendered shorts
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-shorts
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
