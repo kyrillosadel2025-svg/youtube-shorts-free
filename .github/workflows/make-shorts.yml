@@ -19,7 +19,7 @@ on:
 jobs:
   build-shorts:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -40,21 +40,21 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg curl
+          sudo apt-get install -y ffmpeg curl fonts-dejavu-core
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install yt-dlp, Whisper and YouTube JS support
+      - name: Install Python dependencies
         run: |
-           python3 -m pip install --upgrade pip
-           python3 -m pip install -U "yt-dlp[default]"
-           python3 -m pip install faster-whisper
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -U "yt-dlp[default]"
+          python3 -m pip install faster-whisper opencv-python-headless mediapipe numpy
 
-           curl -fsSL https://deno.land/install.sh | sh
-           echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
 
       - name: Restore YouTube cookies
         env:
@@ -64,15 +64,8 @@ jobs:
             echo "Missing YOUTUBE_COOKIES_B64 secret"
             exit 1
           fi
-
           echo "$YOUTUBE_COOKIES_B64" | base64 --decode > cookies.txt
-
-          if [ ! -s cookies.txt ]; then
-            echo "cookies.txt is empty"
-            exit 1
-          fi
-
-          echo "cookies.txt restored successfully"
+          test -s cookies.txt
 
       - name: Check tools
         run: |
@@ -81,25 +74,25 @@ jobs:
           yt-dlp --version
           "$HOME/.deno/bin/deno" --version
 
-      - name: Create shorts
+      - name: Create smart edited shorts
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           YOUTUBE_URL: ${{ steps.vars.outputs.youtube_url }}
           CLIPS_COUNT: ${{ steps.vars.outputs.clips_count }}
           YOUTUBE_COOKIES_FILE: ${{ github.workspace }}/cookies.txt
           GEMINI_MODEL: gemini-3.5-flash-lite
+          WHISPER_MODEL: small
         run: |
           python3 scripts/make_shorts.py
+
       - name: Delete cookies
         if: always()
-        run: |
-          rm -f cookies.txt
+        run: rm -f cookies.txt
 
       - name: Upload rendered shorts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: youtube-shorts
           path: output/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
