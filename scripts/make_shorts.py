@@ -18,6 +18,10 @@ OUT.mkdir(exist_ok=True)
 YOUTUBE_URL = os.environ.get("YOUTUBE_URL", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 CLIPS_COUNT = int(os.environ.get("CLIPS_COUNT", "3") or "3")
+YOUTUBE_COOKIES_FILE = os.environ.get(
+    "YOUTUBE_COOKIES_FILE",
+    ""
+).strip()
 
 GEMINI_MODEL = os.environ.get(
     "GEMINI_MODEL",
@@ -46,11 +50,9 @@ def timestamp_to_seconds(value):
 
     if len(parts) == 3:
         hours, minutes, seconds = parts
-
     elif len(parts) == 2:
         hours = "0"
         minutes, seconds = parts
-
     else:
         raise ValueError(value)
 
@@ -80,11 +82,9 @@ def clean_vtt(vtt_text):
     current = None
 
     for line in lines:
-
         line = line.strip()
 
         if "-->" in line:
-
             left, right = line.split("-->", 1)
 
             start = left.strip().split()[0]
@@ -99,7 +99,6 @@ def clean_vtt(vtt_text):
             chunks.append(current)
 
         elif current and line:
-
             if line.startswith(
                 (
                     "WEBVTT",
@@ -111,15 +110,9 @@ def clean_vtt(vtt_text):
                 continue
 
             text = re.sub(r"<[^>]+>", "", line)
-
-            text = re.sub(
-                r"\s+",
-                " ",
-                text
-            ).strip()
+            text = re.sub(r"\s+", " ", text).strip()
 
             if text:
-
                 if (
                     not current["text"]
                     or current["text"][-1] != text
@@ -127,11 +120,9 @@ def clean_vtt(vtt_text):
                     current["text"].append(text)
 
     cleaned = []
-
     last_text = None
 
     for chunk in chunks:
-
         text = " ".join(chunk["text"]).strip()
 
         if not text:
@@ -144,12 +135,8 @@ def clean_vtt(vtt_text):
 
         cleaned.append(
             {
-                "start": timestamp_to_seconds(
-                    chunk["start"]
-                ),
-                "end": timestamp_to_seconds(
-                    chunk["end"]
-                ),
+                "start": timestamp_to_seconds(chunk["start"]),
+                "end": timestamp_to_seconds(chunk["end"]),
                 "text": text
             }
         )
@@ -157,16 +144,11 @@ def clean_vtt(vtt_text):
     return cleaned
 
 
-def transcript_for_prompt(
-    cues,
-    max_chars=450000
-):
-
+def transcript_for_prompt(cues, max_chars=450000):
     lines = []
     total = 0
 
     for cue in cues:
-
         line = (
             f"[{seconds_to_timestamp(cue['start'])}"
             f" --> "
@@ -178,14 +160,12 @@ def transcript_for_prompt(
             break
 
         lines.append(line)
-
         total += len(line) + 1
 
     return "\n".join(lines)
 
 
 def call_gemini(prompt):
-
     endpoint = (
         "https://generativelanguage.googleapis.com/"
         "v1beta/models/"
@@ -211,9 +191,7 @@ def call_gemini(prompt):
 
     request = urllib.request.Request(
         endpoint,
-        data=json.dumps(
-            payload
-        ).encode("utf-8"),
+        data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json"
         },
@@ -224,21 +202,15 @@ def call_gemini(prompt):
         request,
         timeout=120
     ) as response:
-
         data = json.load(response)
 
     try:
-
         text = (
             data["candidates"][0]
             ["content"]["parts"][0]["text"]
         )
 
-    except (
-        KeyError,
-        IndexError
-    ) as error:
-
+    except (KeyError, IndexError) as error:
         raise RuntimeError(
             "Unexpected Gemini response:\n"
             + json.dumps(
@@ -248,11 +220,9 @@ def call_gemini(prompt):
         ) from error
 
     try:
-
         return json.loads(text)
 
     except json.JSONDecodeError:
-
         match = re.search(
             r"\{.*\}",
             text,
@@ -267,30 +237,16 @@ def call_gemini(prompt):
         )
 
 
-def normalize_clips(
-    data,
-    video_duration
-):
-
-    clips = data.get(
-        "clips",
-        []
-    )
+def normalize_clips(data, video_duration):
+    clips = data.get("clips", [])
 
     result = []
     used = []
 
     for clip in clips:
-
         try:
-
-            start = float(
-                clip["start_seconds"]
-            )
-
-            duration = float(
-                clip["duration"]
-            )
+            start = float(clip["start_seconds"])
+            duration = float(clip["duration"])
 
         except Exception:
             continue
@@ -312,7 +268,6 @@ def normalize_clips(
             video_duration > 0
             and start + duration > video_duration
         ):
-
             start = max(
                 0.0,
                 video_duration - duration
@@ -323,7 +278,6 @@ def normalize_clips(
         overlap = False
 
         for used_start, used_end in used:
-
             intersection = max(
                 0.0,
                 min(
@@ -392,11 +346,7 @@ def normalize_clips(
     return result
 
 
-def safe_filename(
-    text,
-    fallback
-):
-
+def safe_filename(text, fallback):
     text = re.sub(
         r'[\\/:*?"<>|]+',
         "",
@@ -409,10 +359,7 @@ def safe_filename(
         text
     ).strip()
 
-    return (
-        text[:80]
-        or fallback
-    )
+    return text[:80] or fallback
 
 
 YT_COMMON = [
@@ -426,6 +373,12 @@ YT_COMMON = [
 
     "--no-playlist"
 ]
+
+if YOUTUBE_COOKIES_FILE:
+    YT_COMMON += [
+        "--cookies",
+        YOUTUBE_COOKIES_FILE
+    ]
 
 
 print(
@@ -472,7 +425,6 @@ video_files = sorted(
 )
 
 if not video_files:
-
     raise RuntimeError(
         "Video download failed"
     )
@@ -517,7 +469,6 @@ vtt_files = sorted(
 )
 
 if not vtt_files:
-
     raise RuntimeError(
         "No Arabic or English captions were found."
     )
@@ -530,11 +481,8 @@ arabic_files = [
 ]
 
 if arabic_files:
-
     subtitle_path = arabic_files[0]
-
 else:
-
     subtitle_path = vtt_files[0]
 
 
@@ -548,7 +496,6 @@ cues = clean_vtt(
 )
 
 if not cues:
-
     raise RuntimeError(
         "Subtitle file exists but could not be parsed"
     )
