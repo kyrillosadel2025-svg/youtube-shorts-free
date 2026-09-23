@@ -40,7 +40,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg curl
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -49,11 +49,18 @@ jobs:
 
       - name: Install yt-dlp and YouTube JS support
         run: |
-          ppython -m pip install --upgrade pip
-          python -m pip install -U "yt-dlp[default]"
-          curl -fsSL https://deno.land/install.sh | sh
-          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -U "yt-dlp[default]"
 
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+
+      - name: Check tools
+        run: |
+          python3 --version
+          ffmpeg -version | head -n 1
+          yt-dlp --version
+          "$HOME/.deno/bin/deno" --version
 
       - name: Create shorts
         env:
@@ -61,12 +68,13 @@ jobs:
           YOUTUBE_URL: ${{ steps.vars.outputs.youtube_url }}
           CLIPS_COUNT: ${{ steps.vars.outputs.clips_count }}
         run: |
-          python scripts/make_shorts.py
+          python3 scripts/make_shorts.py
 
       - name: Upload rendered shorts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: youtube-shorts
           path: output/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 7
