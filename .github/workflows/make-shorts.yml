@@ -51,9 +51,26 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -U "yt-dlp[default]"
-
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+
+      - name: Restore YouTube cookies
+        env:
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+        run: |
+          if [ -z "$YOUTUBE_COOKIES_B64" ]; then
+            echo "Missing YOUTUBE_COOKIES_B64 secret"
+            exit 1
+          fi
+
+          echo "$YOUTUBE_COOKIES_B64" | base64 --decode > cookies.txt
+
+          if [ ! -s cookies.txt ]; then
+            echo "cookies.txt is empty"
+            exit 1
+          fi
+
+          echo "cookies.txt restored successfully"
 
       - name: Check tools
         run: |
@@ -67,8 +84,14 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           YOUTUBE_URL: ${{ steps.vars.outputs.youtube_url }}
           CLIPS_COUNT: ${{ steps.vars.outputs.clips_count }}
+          YOUTUBE_COOKIES_FILE: ${{ github.workspace }}/cookies.txt
         run: |
           python3 scripts/make_shorts.py
+
+      - name: Delete cookies
+        if: always()
+        run: |
+          rm -f cookies.txt
 
       - name: Upload rendered shorts
         if: always()
