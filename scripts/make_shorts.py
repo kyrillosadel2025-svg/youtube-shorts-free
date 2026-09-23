@@ -188,6 +188,8 @@ video_tpl = str(WORK / "source.%(ext)s")
 run([
     "yt-dlp",
     "--no-playlist",
+    "--js-runtimes", "deno",
+    "--remote-components", "ejs:npm",
     "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
     "--merge-output-format", "mp4",
     "-o", video_tpl,
