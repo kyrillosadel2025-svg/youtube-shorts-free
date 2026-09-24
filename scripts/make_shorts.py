@@ -239,8 +239,8 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: Caption,DejaVu Sans,64,&H00FFFFFF,&H000000FF,&H00000000,&H78000000,-1,0,0,0,100,100,0,0,1,5,0,2,70,70,180,1
-Style: Hook,DejaVu Sans,76,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,6,0,8,80,80,140,1
+Style: Caption,DejaVu Sans,58,&H00FFFFFF,&H000000FF,&H00000000,&H78000000,-1,0,0,0,100,100,0,0,1,5,0,2,80,80,260,1
+Style: Hook,DejaVu Sans,66,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,6,0,8,90,90,180,1
 
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
@@ -269,23 +269,14 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 
 def smart_reframe(input_clip, output_silent):
     """
-    Dynamic 9:16 crop using OpenCV's built-in Haar face detector.
+    Hybrid smart camera for both real people and animation.
 
-    Why OpenCV-only:
-    - No MediaPipe API/version mismatch.
-    - No external model download.
-    - Works on GitHub Actions CPU runners.
-
-    Behavior:
-    - Detect faces several times per second.
-    - Track the nearest previously selected face to reduce camera jumps.
-    - Smooth camera center and zoom.
-    - Keep two nearby dominant faces in frame when possible.
-    - Return gradually to centered framing when no face is detected.
+    Priority:
+    1) Human face detection (OpenCV Haar cascade).
+    2) Motion/subject tracking fallback when faces are not found.
+    3) Safe centered framing for static scenes.
     """
-
     cap = cv2.VideoCapture(str(input_clip))
-
     if not cap.isOpened():
         raise RuntimeError(f"Could not open {input_clip}")
 
@@ -293,396 +284,179 @@ def smart_reframe(input_clip, output_silent):
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
     if W <= 0 or H <= 0:
         raise RuntimeError("Invalid source video dimensions")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
-    writer = cv2.VideoWriter(
-        str(output_silent),
-        fourcc,
-        fps,
-        (OUT_W, OUT_H)
-    )
-
+    writer = cv2.VideoWriter(str(output_silent), fourcc, fps, (OUT_W, OUT_H))
     if not writer.isOpened():
         raise RuntimeError("Could not create VideoWriter")
 
-    cascade_path = (
-        cv2.data.haarcascades
-        + "haarcascade_frontalface_default.xml"
-    )
-
-    face_cascade = cv2.CascadeClassifier(
-        cascade_path
-    )
-
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    face_cascade = cv2.CascadeClassifier(cascade_path)
     if face_cascade.empty():
-        raise RuntimeError(
-            "Could not load OpenCV Haar face cascade"
-        )
+        raise RuntimeError("Could not load OpenCV Haar face cascade")
 
-    # About 6-8 detections/sec. Tracking between scans is done by smoothing.
-    detect_every = max(
-        1,
-        int(round(fps / 7))
-    )
+    face_detect_every = max(1, int(round(fps / 6)))
+    motion_scale = min(1.0, 640.0 / max(W, H))
 
-    smooth_center = 0.12
-    smooth_zoom = 0.075
+    smooth_center = 0.075
+    smooth_zoom = 0.045
+    dead_zone_x = W * 0.025
+    dead_zone_y = H * 0.025
 
     x_center = W / 2
     y_center = H / 2
-
     crop_h = float(H)
-
     target_x = x_center
     target_y = y_center
     target_h = crop_h
 
     last_face_center = None
-    last_faces = []
-
+    no_face_scans = 0
+    prev_gray_small = None
+    motion_center = None
+    motion_strength = 0.0
     frame_idx = 0
 
     while True:
-
         ok, frame = cap.read()
-
         if not ok:
             break
 
-        if frame_idx % detect_every == 0:
+        if motion_scale < 1.0:
+            small = cv2.resize(frame, None, fx=motion_scale, fy=motion_scale, interpolation=cv2.INTER_AREA)
+        else:
+            small = frame
 
-            # Detect at reduced resolution for speed.
-            detect_scale = min(
-                1.0,
-                960.0 / max(W, H)
-            )
+        gray_small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        gray_small = cv2.GaussianBlur(gray_small, (7, 7), 0)
+        motion_center = None
+        motion_strength = 0.0
 
+        if prev_gray_small is not None:
+            diff = cv2.absdiff(gray_small, prev_gray_small)
+            _, mask = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.dilate(mask, kernel, iterations=2)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                candidates = []
+                frame_area_small = mask.shape[0] * mask.shape[1]
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area < frame_area_small * 0.003:
+                        continue
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    candidates.append((area, x + w/2, y + h/2))
+                if candidates:
+                    candidates.sort(reverse=True, key=lambda c: c[0])
+                    top = candidates[:3]
+                    total_area = sum(c[0] for c in top)
+                    if total_area > 0:
+                        mx = sum(c[0] * c[1] for c in top) / total_area
+                        my = sum(c[0] * c[2] for c in top) / total_area
+                        inv = 1.0 / motion_scale
+                        motion_center = (mx * inv, my * inv)
+                        motion_strength = min(1.0, total_area / (frame_area_small * 0.18))
+
+        prev_gray_small = gray_small
+        faces = []
+
+        if frame_idx % face_detect_every == 0:
+            detect_scale = min(1.0, 960.0 / max(W, H))
             if detect_scale < 1.0:
-
-                small = cv2.resize(
-                    frame,
-                    None,
-                    fx=detect_scale,
-                    fy=detect_scale,
-                    interpolation=cv2.INTER_AREA
-                )
-
+                detect_frame = cv2.resize(frame, None, fx=detect_scale, fy=detect_scale, interpolation=cv2.INTER_AREA)
             else:
-                small = frame
-
-            gray = cv2.cvtColor(
-                small,
-                cv2.COLOR_BGR2GRAY
-            )
-
+                detect_frame = frame
+            gray = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.equalizeHist(gray)
-
-            found = face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.08,
-                minNeighbors=5,
-                minSize=(35, 35),
-                flags=cv2.CASCADE_SCALE_IMAGE
-            )
-
-            faces = []
-
+            found = face_cascade.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=5, minSize=(35, 35), flags=cv2.CASCADE_SCALE_IMAGE)
             inv = 1.0 / detect_scale
-
             for (x, y, w, h) in found:
-
-                x1 = int(x * inv)
-                y1 = int(y * inv)
-                x2 = int((x + w) * inv)
-                y2 = int((y + h) * inv)
-
-                x1 = max(0, min(x1, W - 1))
-                y1 = max(0, min(y1, H - 1))
-                x2 = max(x1 + 1, min(x2, W))
-                y2 = max(y1 + 1, min(y2, H))
-
-                area = (
-                    (x2 - x1)
-                    * (y2 - y1)
-                )
-
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
-
-                faces.append(
-                    (
-                        area,
-                        cx,
-                        cy,
-                        x1,
-                        y1,
-                        x2,
-                        y2
-                    )
-                )
+                x1, y1 = int(x*inv), int(y*inv)
+                x2, y2 = int((x+w)*inv), int((y+h)*inv)
+                x1 = max(0, min(x1, W-1)); y1 = max(0, min(y1, H-1))
+                x2 = max(x1+1, min(x2, W)); y2 = max(y1+1, min(y2, H))
+                area = (x2-x1)*(y2-y1)
+                faces.append((area, (x1+x2)/2, (y1+y2)/2, x1, y1, x2, y2))
 
             if faces:
-
-                faces.sort(
-                    reverse=True,
-                    key=lambda item: item[0]
-                )
-
+                no_face_scans = 0
+                faces.sort(reverse=True, key=lambda item: item[0])
                 chosen = faces[0]
-
-                # Prefer continuity if the previously tracked face is still visible.
                 if last_face_center is not None:
-
-                    nearest = min(
-                        faces,
-                        key=lambda f:
-                            (
-                                (f[1] - last_face_center[0]) ** 2
-                                + (f[2] - last_face_center[1]) ** 2
-                            )
-                    )
-
-                    if (
-                        nearest[0]
-                        >= faces[0][0] * 0.45
-                    ):
+                    nearest = min(faces, key=lambda f: (f[1]-last_face_center[0])**2 + (f[2]-last_face_center[1])**2)
+                    if nearest[0] >= faces[0][0] * 0.50:
                         chosen = nearest
-
                 group = [chosen]
-
-                # Keep a nearby second person if it is visually important.
-                candidates = [
-                    f for f in faces
-                    if f is not chosen
-                ]
-
-                if candidates:
-
-                    second = min(
-                        candidates,
-                        key=lambda f:
-                            abs(f[1] - chosen[1])
-                    )
-
-                    horizontal_distance = abs(
-                        second[1] - chosen[1]
-                    )
-
-                    if (
-                        horizontal_distance < W * 0.42
-                        and second[0] > chosen[0] * 0.38
-                    ):
+                others = [f for f in faces if f is not chosen]
+                if others:
+                    second = min(others, key=lambda f: abs(f[1]-chosen[1]))
+                    if abs(second[1]-chosen[1]) < W*0.44 and second[0] > chosen[0]*0.42:
                         group.append(second)
 
-                min_x = min(
-                    f[3] for f in group
-                )
-
-                min_y = min(
-                    f[4] for f in group
-                )
-
-                max_x = max(
-                    f[5] for f in group
-                )
-
-                max_y = max(
-                    f[6] for f in group
-                )
-
-                target_x = (
-                    min_x + max_x
-                ) / 2
-
-                # Bias framing slightly upward so faces sit naturally in vertical video.
-                face_mid_y = (
-                    min_y + max_y
-                ) / 2
-
-                target_y = (
-                    face_mid_y
-                    + H * 0.06
-                )
-
-                union_w = max_x - min_x
-                union_h = max_y - min_y
-
-                # For one face, don't zoom too aggressively.
+                min_x = min(f[3] for f in group); min_y = min(f[4] for f in group)
+                max_x = max(f[5] for f in group); max_y = max(f[6] for f in group)
+                target_x = (min_x + max_x)/2
+                target_y = ((min_y + max_y)/2) + H*0.055
+                union_w = max_x-min_x; union_h = max_y-min_y
                 if len(group) == 1:
-
-                    desired_h_from_face = (
-                        union_h / 0.29
-                    )
-
-                    desired_h_from_width = (
-                        union_w / 0.34
-                    )
-
-                    min_crop_ratio = 0.60
-
+                    desired_h = max(union_h/0.27, union_w/0.31)
+                    min_crop_ratio = 0.68
                 else:
-
-                    desired_h_from_face = (
-                        union_h / 0.34
-                    )
-
-                    desired_h_from_width = (
-                        union_w / 0.48
-                    )
-
-                    min_crop_ratio = 0.72
-
-                target_h = max(
-                    desired_h_from_face,
-                    desired_h_from_width
-                )
-
-                target_h = float(
-                    np.clip(
-                        target_h,
-                        H * min_crop_ratio,
-                        H
-                    )
-                )
-
-                last_face_center = (
-                    chosen[1],
-                    chosen[2]
-                )
-
-                last_faces = faces
-
+                    desired_h = max(union_h/0.31, union_w/0.46)
+                    min_crop_ratio = 0.78
+                target_h = float(np.clip(desired_h, H*min_crop_ratio, H))
+                last_face_center = (chosen[1], chosen[2])
             else:
+                no_face_scans += 1
 
-                # No face this scan:
-                # slowly recover toward safe center framing.
-                target_x = W / 2
-                target_y = H / 2
-                target_h = H
+        if no_face_scans >= 2 and motion_center is not None:
+            mx, my = motion_center
+            motion_weight = 0.45 + 0.30 * motion_strength
+            target_x = target_x*(1.0-motion_weight) + mx*motion_weight
+            target_y = target_y*(1.0-motion_weight) + my*motion_weight
+            target_h = max(target_h, H*0.78)
+        elif no_face_scans >= 5 and motion_center is None:
+            target_x = W/2
+            target_y = H/2
+            target_h = H*0.94
 
-                last_faces = []
+        dx = target_x - x_center
+        dy = target_y - y_center
+        if abs(dx) < dead_zone_x: dx = 0.0
+        if abs(dy) < dead_zone_y: dy = 0.0
 
-        x_center += (
-            target_x - x_center
-        ) * smooth_center
-
-        y_center += (
-            target_y - y_center
-        ) * smooth_center
-
-        crop_h += (
-            target_h - crop_h
-        ) * smooth_zoom
-
-        crop_h = float(
-            np.clip(
-                crop_h,
-                H * 0.58,
-                H
-            )
-        )
-
-        crop_w = (
-            crop_h
-            * OUT_W
-            / OUT_H
-        )
-
-        # Keep crop inside source dimensions.
+        x_center += dx * smooth_center
+        y_center += dy * smooth_center
+        crop_h += (target_h - crop_h) * smooth_zoom
+        crop_h = float(np.clip(crop_h, H*0.66, H))
+        crop_w = crop_h * OUT_W / OUT_H
         if crop_w > W:
-
             crop_w = float(W)
+            crop_h = crop_w * OUT_H / OUT_W
 
-            crop_h = (
-                crop_w
-                * OUT_H
-                / OUT_W
-            )
-
-        crop_w_i = max(
-            2,
-            int(round(crop_w))
-        )
-
-        crop_h_i = max(
-            2,
-            int(round(crop_h))
-        )
-
-        x1 = int(
-            round(
-                x_center
-                - crop_w_i / 2
-            )
-        )
-
-        y1 = int(
-            round(
-                y_center
-                - crop_h_i / 2
-            )
-        )
-
-        x1 = max(
-            0,
-            min(
-                x1,
-                W - crop_w_i
-            )
-        )
-
-        y1 = max(
-            0,
-            min(
-                y1,
-                H - crop_h_i
-            )
-        )
-
-        x2 = x1 + crop_w_i
-        y2 = y1 + crop_h_i
-
-        roi = frame[
-            y1:y2,
-            x1:x2
-        ]
-
+        crop_w_i = max(2, int(round(crop_w)))
+        crop_h_i = max(2, int(round(crop_h)))
+        x1 = int(round(x_center - crop_w_i/2))
+        y1 = int(round(y_center - crop_h_i/2))
+        x1 = max(0, min(x1, W-crop_w_i))
+        y1 = max(0, min(y1, H-crop_h_i))
+        roi = frame[y1:y1+crop_h_i, x1:x1+crop_w_i]
         if roi.size == 0:
-
             roi = frame
-
-        out_frame = cv2.resize(
-            roi,
-            (OUT_W, OUT_H),
-            interpolation=cv2.INTER_AREA
-        )
-
+        out_frame = cv2.resize(roi, (OUT_W, OUT_H), interpolation=cv2.INTER_AREA)
         writer.write(out_frame)
 
         frame_idx += 1
-
-        if (
-            frame_idx
-            % max(
-                1,
-                int(fps * 10)
-            )
-            == 0
-        ):
-
-            print(
-                f"Smart reframe: "
-                f"{frame_idx}/{total} frames",
-                flush=True
-            )
+        if frame_idx % max(1, int(fps*10)) == 0:
+            mode = 'face' if no_face_scans < 2 else ('motion' if motion_center is not None else 'center')
+            print(f"Smart reframe: {frame_idx}/{total} frames | mode={mode}", flush=True)
 
     writer.release()
     cap.release()
-
 
 def render_short(source_video, cues, clip, index):
     title = clean_filename(clip["title"], f"short-{index}")
