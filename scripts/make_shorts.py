@@ -4,6 +4,7 @@ import math
 import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -134,7 +135,37 @@ def transcribe_with_whisper(video_path):
 
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    model = None
+    last_error = None
+
+    for attempt in range(1, 5):
+        try:
+            print(
+                f"Loading Whisper model '{WHISPER_MODEL}' (attempt {attempt}/4)...",
+                flush=True
+            )
+            model = WhisperModel(
+                WHISPER_MODEL,
+                device="cpu",
+                compute_type="int8",
+                download_root=str(WORK / "whisper-models"),
+                local_files_only=False,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            print(f"Whisper model load failed: {str(exc)[:1200]}", flush=True)
+            if attempt < 4:
+                wait_seconds = 70 * attempt
+                print(f"Waiting {wait_seconds}s before retry...", flush=True)
+                time.sleep(wait_seconds)
+
+    if model is None:
+        raise RuntimeError(
+            "Could not load/download the Whisper model after retries. "
+            "If the log contains HTTP 429, add a free Hugging Face access token "
+            "as GitHub secret HF_TOKEN. Last error: " + str(last_error)
+        )
     segments, info = model.transcribe(
         str(audio),
         beam_size=5,
