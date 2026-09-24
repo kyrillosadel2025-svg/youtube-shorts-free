@@ -51,7 +51,10 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -U "yt-dlp[default]"
-          python3 -m pip install faster-whisper opencv-python-headless numpy
+          python3 -m pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless || true
+          python3 -m pip install "numpy==1.26.4"
+          python3 -m pip install "opencv-python-headless==4.10.0.84"
+          python3 -m pip install faster-whisper
 
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
@@ -73,6 +76,14 @@ jobs:
           ffmpeg -version | head -n 1
           yt-dlp --version
           "$HOME/.deno/bin/deno" --version
+          python3 - <<'PY'
+          import cv2
+          print("cv2 file:", cv2.__file__)
+          print("cv2 version:", cv2.__version__)
+          print("Has CascadeClassifier:", hasattr(cv2, "CascadeClassifier"))
+          if not hasattr(cv2, "CascadeClassifier"):
+              raise SystemExit("Broken OpenCV install: CascadeClassifier missing")
+          PY
 
       - name: Create smart edited shorts
         env:
