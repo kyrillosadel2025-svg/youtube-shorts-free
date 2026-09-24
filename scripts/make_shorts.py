@@ -11,6 +11,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+print("OpenCV:", getattr(cv2, "__version__", "unknown"))
+print("OpenCV module:", getattr(cv2, "__file__", "unknown"))
+
+if not hasattr(cv2, "CascadeClassifier"):
+    raise RuntimeError(
+        "OpenCV installation is incomplete: cv2.CascadeClassifier is missing. "
+        "Use opencv-python-headless==4.10.0.84."
+    )
+
 ROOT = Path.cwd()
 WORK = ROOT / "work"
 OUT = ROOT / "output"
