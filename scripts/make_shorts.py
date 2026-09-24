@@ -231,13 +231,15 @@ def normalize_clips(data, video_duration):
 
 def build_ass_for_clip(cues, clip_start, clip_duration, hook, out_path):
     """
-    Burned captions with a soft neon glow.
+    v8.1 Real Glow captions.
 
-    Two layers are rendered for every caption:
-    - Glow layer: larger semi-transparent cyan/blue outline.
-    - Main layer: crisp white text with a smaller dark outline.
+    Each caption is drawn in 3 layers:
+    1) Wide blurred cyan glow.
+    2) Tighter blue/cyan glow.
+    3) Crisp white foreground text.
 
-    Same idea for the hook at the top.
+    The glow uses ASS \\blur override tags, so FFmpeg/libass renders
+    an actual soft halo instead of a simple thick outline.
     """
 
     header = f"""[Script Info]
@@ -249,10 +251,13 @@ WrapStyle: 2
 
 [V4+ Styles]
 Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: CaptionGlow,DejaVu Sans,60,&H55FFFFFF,&H000000FF,&H8840E0FF,&H00000000,-1,0,0,0,100,100,0,0,1,11,0,2,80,80,250,1
-Style: Caption,DejaVu Sans,58,&H00FFFFFF,&H000000FF,&H00101010,&H50000000,-1,0,0,0,100,100,0,0,1,3.5,0,2,80,80,250,1
-Style: HookGlow,DejaVu Sans,68,&H44FFFFFF,&H000000FF,&H8850D8FF,&H00000000,-1,0,0,0,100,100,0,0,1,13,0,8,90,90,175,1
-Style: Hook,DejaVu Sans,66,&H00FFFFFF,&H000000FF,&H00101010,&H50000000,-1,0,0,0,100,100,0,0,1,4,0,8,90,90,175,1
+Style: CaptionGlowWide,DejaVu Sans,60,&H66FFFFFF,&H000000FF,&HAA00E5FF,&H00000000,-1,0,0,0,100,100,0,0,1,8,0,2,80,80,250,1
+Style: CaptionGlowTight,DejaVu Sans,59,&H33FFFFFF,&H000000FF,&HCC00BFFF,&H00000000,-1,0,0,0,100,100,0,0,1,5,0,2,80,80,250,1
+Style: Caption,DejaVu Sans,58,&H00FFFFFF,&H000000FF,&H00101010,&H50000000,-1,0,0,0,100,100,0,0,1,3.2,0,2,80,80,250,1
+
+Style: HookGlowWide,DejaVu Sans,68,&H66FFFFFF,&H000000FF,&HAA00E5FF,&H00000000,-1,0,0,0,100,100,0,0,1,9,0,8,90,90,175,1
+Style: HookGlowTight,DejaVu Sans,67,&H33FFFFFF,&H000000FF,&HCC00BFFF,&H00000000,-1,0,0,0,100,100,0,0,1,5.5,0,8,90,90,175,1
+Style: Hook,DejaVu Sans,66,&H00FFFFFF,&H000000FF,&H00101010,&H50000000,-1,0,0,0,100,100,0,0,1,3.6,0,8,90,90,175,1
 
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
@@ -260,16 +265,32 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 
     events = []
 
+    def add_glow_triplet(start_t, end_t, base_style, text):
+        if base_style == "Caption":
+            events.append(
+                f"Dialogue: 0,{sec_to_ass_time(start_t)},{sec_to_ass_time(end_t)},CaptionGlowWide,,0,0,0,,{{\\blur10\\bord9\\1a&H99&\\3a&H55&}}{text}"
+            )
+            events.append(
+                f"Dialogue: 1,{sec_to_ass_time(start_t)},{sec_to_ass_time(end_t)},CaptionGlowTight,,0,0,0,,{{\\blur4.5\\bord6\\1a&H77&\\3a&H33&}}{text}"
+            )
+            events.append(
+                f"Dialogue: 2,{sec_to_ass_time(start_t)},{sec_to_ass_time(end_t)},Caption,,0,0,0,,{{\\blur0.6}}{text}"
+            )
+        else:
+            events.append(
+                f"Dialogue: 0,{sec_to_ass_time(start_t)},{sec_to_ass_time(end_t)},HookGlowWide,,0,0,0,,{{\\blur11\\bord10\\1a&H99&\\3a&H55&}}{text}"
+            )
+            events.append(
+                f"Dialogue: 1,{sec_to_ass_time(start_t)},{sec_to_ass_time(end_t)},HookGlowTight,,0,0,0,,{{\\blur5\\bord6.5\\1a&H77&\\3a&H33&}}{text}"
+            )
+            events.append(
+                f"Dialogue: 2,{sec_to_ass_time(start_t)},{sec_to_ass_time(end_t)},Hook,,0,0,0,,{{\\blur0.6}}{text}"
+            )
+
     if hook:
         hook_text = escape_ass(wrap_caption(hook, 22))
         hook_end = min(3.0, clip_duration)
-
-        events.append(
-            f"Dialogue: 0,{sec_to_ass_time(0)},{sec_to_ass_time(hook_end)},HookGlow,,0,0,0,,{hook_text}"
-        )
-        events.append(
-            f"Dialogue: 1,{sec_to_ass_time(0)},{sec_to_ass_time(hook_end)},Hook,,0,0,0,,{hook_text}"
-        )
+        add_glow_triplet(0, hook_end, "Hook", hook_text)
 
     clip_end = clip_start + clip_duration
 
@@ -290,13 +311,7 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
             )
         )
 
-        events.append(
-            f"Dialogue: 0,{sec_to_ass_time(start)},{sec_to_ass_time(end)},CaptionGlow,,0,0,0,,{text}"
-        )
-
-        events.append(
-            f"Dialogue: 1,{sec_to_ass_time(start)},{sec_to_ass_time(end)},Caption,,0,0,0,,{text}"
-        )
+        add_glow_triplet(start, end, "Caption", text)
 
     out_path.write_text(
         header + "\n".join(events) + "\n",
