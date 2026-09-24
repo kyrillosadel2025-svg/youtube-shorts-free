@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -734,6 +735,315 @@ def smart_reframe(input_clip, output_silent):
     cap.release()
 
 
+
+def probe_media(path):
+    """Return ffprobe JSON for a rendered short."""
+    raw = capture([
+        "ffprobe", "-v", "error",
+        "-show_streams",
+        "-show_format",
+        "-of", "json",
+        path,
+    ])
+    return json.loads(raw)
+
+
+def estimate_edge_brightness(video_path, seconds=0.7):
+    """
+    Sample the first and last ~0.7s.
+    Returns average luma for both ends.
+    Helps catch black/blank openings or endings.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None, None
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    sample_n = max(2, int(round(fps * seconds)))
+
+    def avg_at(indices):
+        vals = []
+        for frame_no in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_no)))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            vals.append(float(np.mean(gray)))
+        return float(np.mean(vals)) if vals else None
+
+    first_idx = np.linspace(0, max(0, sample_n - 1), min(sample_n, 8))
+    last_start = max(0, total - sample_n)
+    last_idx = np.linspace(last_start, max(last_start, total - 1), min(sample_n, 8))
+
+    first = avg_at(first_idx)
+    last = avg_at(last_idx)
+    cap.release()
+    return first, last
+
+
+def measure_mean_volume(video_path):
+    """
+    Uses FFmpeg volumedetect.
+    Returns mean_volume in dB, or None if unavailable.
+    """
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-nostats",
+            "-i", str(video_path),
+            "-af", "volumedetect",
+            "-f", "null", "-"
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    log = (proc.stderr or "") + "\n" + (proc.stdout or "")
+    m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", log)
+    return float(m.group(1)) if m else None
+
+
+def caption_coverage(cues, clip_start, clip_duration):
+    """
+    Rough fraction of the clip covered by transcript cues.
+    This does not OCR the burned subtitles; it verifies that
+    the caption source actually covers enough of the selected clip.
+    """
+    clip_end = clip_start + clip_duration
+    spans = []
+
+    for cue in cues:
+        a = max(clip_start, float(cue["start"]))
+        b = min(clip_end, float(cue["end"]))
+        if b > a:
+            spans.append((a, b))
+
+    if not spans:
+        return 0.0
+
+    spans.sort()
+    merged = [list(spans[0])]
+
+    for a, b in spans[1:]:
+        if a <= merged[-1][1] + 0.08:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+
+    covered = sum(b - a for a, b in merged)
+    return max(0.0, min(1.0, covered / max(0.001, clip_duration)))
+
+
+
+def measure_audio_polish(video_path):
+    """
+    Collect post-render audio metrics.
+    loudnorm output is not required here; this is a light validation pass.
+    """
+    metrics = {
+        "mean_volume_db": None,
+        "max_volume_db": None,
+    }
+
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-nostats",
+            "-i", str(video_path),
+            "-af", "volumedetect",
+            "-f", "null", "-"
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    log = (proc.stderr or "") + "\n" + (proc.stdout or "")
+
+    m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", log)
+    p = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", log)
+
+    if m:
+        metrics["mean_volume_db"] = float(m.group(1))
+    if p:
+        metrics["max_volume_db"] = float(p.group(1))
+
+    return metrics
+
+
+def quality_gate(video_path, clip, cues):
+    """
+    Automatic post-render Quality Gate.
+
+    Hard failures:
+    - wrong/missing video stream
+    - wrong output dimensions
+    - duration outside Shorts target window
+    - missing audio
+    - effectively silent audio
+    - near-black beginning/end
+
+    Soft warnings:
+    - low caption coverage
+    - unusually quiet audio
+
+    Score is informational; hard failures determine approval.
+    """
+    report = {
+        "file": Path(video_path).name,
+        "approved": True,
+        "score": 100,
+        "checks": {},
+        "warnings": [],
+        "failures": [],
+    }
+
+    try:
+        meta = probe_media(video_path)
+    except Exception as exc:
+        report["approved"] = False
+        report["score"] = 0
+        report["failures"].append(f"ffprobe failed: {exc}")
+        return report
+
+    streams = meta.get("streams", [])
+    video_streams = [s for s in streams if s.get("codec_type") == "video"]
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+
+    # Video stream / resolution
+    if not video_streams:
+        report["approved"] = False
+        report["score"] -= 50
+        report["failures"].append("missing video stream")
+        width = height = 0
+    else:
+        width = int(video_streams[0].get("width") or 0)
+        height = int(video_streams[0].get("height") or 0)
+
+    resolution_ok = (width == OUT_W and height == OUT_H)
+    report["checks"]["resolution"] = {
+        "width": width,
+        "height": height,
+        "expected": f"{OUT_W}x{OUT_H}",
+        "ok": resolution_ok,
+    }
+
+    if not resolution_ok:
+        report["approved"] = False
+        report["score"] -= 25
+        report["failures"].append("output resolution is not 1080x1920")
+
+    # Duration
+    duration = float(meta.get("format", {}).get("duration") or 0.0)
+    duration_ok = 34.0 <= duration <= 46.0
+    report["checks"]["duration"] = {
+        "seconds": round(duration, 3),
+        "ok": duration_ok,
+    }
+
+    if not duration_ok:
+        report["approved"] = False
+        report["score"] -= 20
+        report["failures"].append(
+            f"duration {duration:.2f}s is outside 34–46s gate"
+        )
+
+    # Audio presence
+    has_audio = bool(audio_streams)
+    report["checks"]["audio_stream"] = {"present": has_audio, "ok": has_audio}
+
+    if not has_audio:
+        report["approved"] = False
+        report["score"] -= 30
+        report["failures"].append("missing audio stream")
+
+    # Audio level
+    mean_volume = measure_mean_volume(video_path) if has_audio else None
+    polish_metrics = measure_audio_polish(video_path) if has_audio else {
+        "mean_volume_db": None,
+        "max_volume_db": None,
+    }
+    report["checks"]["audio_polish"] = {
+        **polish_metrics,
+        "target_integrated_lufs": -14,
+        "target_true_peak_db": -1.5,
+        "processing": [
+            "highpass 70Hz",
+            "light FFT denoise",
+            "loudness normalization",
+            "peak limiter",
+        ],
+    }
+    audio_level_ok = mean_volume is None or mean_volume > -45.0
+    report["checks"]["mean_volume"] = {
+        "db": mean_volume,
+        "ok": audio_level_ok,
+    }
+
+    if mean_volume is not None:
+        if mean_volume <= -45.0:
+            report["approved"] = False
+            report["score"] -= 30
+            report["failures"].append(
+                f"audio is effectively silent ({mean_volume:.1f} dB)"
+            )
+        elif mean_volume < -28.0:
+            report["score"] -= 8
+            report["warnings"].append(
+                f"audio is quiet ({mean_volume:.1f} dB)"
+            )
+
+    # Beginning/end brightness
+    first_luma, last_luma = estimate_edge_brightness(video_path)
+    first_ok = first_luma is None or first_luma >= 8.0
+    last_ok = last_luma is None or last_luma >= 8.0
+
+    report["checks"]["edge_brightness"] = {
+        "first_luma": None if first_luma is None else round(first_luma, 2),
+        "last_luma": None if last_luma is None else round(last_luma, 2),
+        "first_ok": first_ok,
+        "last_ok": last_ok,
+    }
+
+    if not first_ok:
+        report["approved"] = False
+        report["score"] -= 15
+        report["failures"].append("opening appears nearly black")
+
+    if not last_ok:
+        report["approved"] = False
+        report["score"] -= 15
+        report["failures"].append("ending appears nearly black")
+
+    # Caption source coverage
+    coverage = caption_coverage(
+        cues,
+        float(clip["start_seconds"]),
+        float(clip["duration"]),
+    )
+
+    report["checks"]["caption_coverage"] = {
+        "ratio": round(coverage, 3),
+        "percent": round(coverage * 100, 1),
+        "ok": coverage >= 0.45,
+    }
+
+    if coverage < 0.30:
+        report["score"] -= 15
+        report["warnings"].append(
+            f"very low caption coverage ({coverage*100:.1f}%)"
+        )
+    elif coverage < 0.45:
+        report["score"] -= 7
+        report["warnings"].append(
+            f"low caption coverage ({coverage*100:.1f}%)"
+        )
+
+    report["score"] = max(0, min(100, int(report["score"])))
+    return report
+
+
 def render_short(source_video, cues, clip, index):
     title = clean_filename(clip["title"], f"short-{index}")
     base_clip = WORK / f"clip_{index:02d}_base.mp4"
@@ -747,6 +1057,7 @@ def render_short(source_video, cues, clip, index):
         "-i", source_video,
         "-t", str(clip["duration"]),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-af", "highpass=f=70,afftdn=nf=-28:tn=1,loudnorm=I=-14:LRA=9:TP=-1.5,alimiter=limit=0.95",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         base_clip,
@@ -864,25 +1175,91 @@ manifest = {
     "gemini_model": GEMINI_MODEL,
     "whisper_model": WHISPER_MODEL,
     "editing": {
-        "smart_camera": True,
-        "face_tracking": True,
-        "smooth_reframe": True,
-        "auto_zoom": True,
+        "scene_based_reframe": True,
+        "continuous_camera_tracking": False,
+        "real_glow_captions": True,
         "burned_captions": True,
         "hook_overlay": True,
+        "quality_gate": True,
+        "audio_polish": True,
+        "target_loudness_lufs": -14,
+        "true_peak_db": -1.5,
     },
     "clips": [],
+    "quality_summary": {
+        "approved": 0,
+        "rejected": 0,
+    },
 }
 
-print("\n===== RENDER SMART SHORTS =====\n", flush=True)
+quality_reports = []
+
+print("\n===== RENDER + QUALITY GATE =====\n", flush=True)
+
 for i, clip in enumerate(clips, 1):
     out_file = render_short(source_video, cues, clip, i)
-    manifest["clips"].append({**clip, "file": out_file.name})
+
+    print(f"\n===== QUALITY GATE {i} =====\n", flush=True)
+    report = quality_gate(out_file, clip, cues)
+    quality_reports.append(report)
+
+    entry = {
+        **clip,
+        "file": out_file.name,
+        "quality": report,
+    }
+
+    if report["approved"]:
+        manifest["quality_summary"]["approved"] += 1
+        entry["status"] = "approved"
+        print(
+            f"APPROVED: {out_file.name} | score={report['score']}",
+            flush=True
+        )
+    else:
+        manifest["quality_summary"]["rejected"] += 1
+        entry["status"] = "rejected"
+
+        rejected_dir = WORK / "rejected"
+        rejected_dir.mkdir(exist_ok=True)
+
+        rejected_path = rejected_dir / out_file.name
+        shutil.move(str(out_file), str(rejected_path))
+
+        entry["file"] = None
+        entry["rejected_file"] = rejected_path.name
+
+        print(
+            f"REJECTED: {rejected_path.name} | "
+            f"score={report['score']} | "
+            f"failures={report['failures']}",
+            flush=True
+        )
+
+    manifest["clips"].append(entry)
+
+(OUT / "quality_report.json").write_text(
+    json.dumps(
+        {
+            "summary": manifest["quality_summary"],
+            "reports": quality_reports,
+        },
+        ensure_ascii=False,
+        indent=2,
+    ),
+    encoding="utf-8",
+)
 
 (OUT / "manifest.json").write_text(
     json.dumps(manifest, ensure_ascii=False, indent=2),
     encoding="utf-8",
 )
+
+if manifest["quality_summary"]["approved"] == 0:
+    raise RuntimeError(
+        "Quality Gate rejected every rendered short. "
+        "See output/quality_report.json in the job logs/artifact context."
+    )
 
 print("\n===== DONE =====\n", flush=True)
 print(json.dumps(manifest, ensure_ascii=False, indent=2))
