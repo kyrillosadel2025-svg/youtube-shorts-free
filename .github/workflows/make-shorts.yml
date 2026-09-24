@@ -54,7 +54,7 @@ jobs:
           python3 -m pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless || true
           python3 -m pip install "numpy==1.26.4"
           python3 -m pip install "opencv-python-headless==4.10.0.84"
-          python3 -m pip install faster-whisper
+          python3 -m pip install faster-whisper huggingface_hub
 
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
@@ -85,6 +85,16 @@ jobs:
               raise SystemExit("Broken OpenCV install: CascadeClassifier missing")
           PY
 
+      - name: Check Hugging Face token
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "WARNING: HF_TOKEN is missing. Whisper model download may be rate-limited."
+          else
+            echo "HF_TOKEN is configured."
+          fi
+
       - name: Create smart edited shorts
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -93,6 +103,8 @@ jobs:
           YOUTUBE_COOKIES_FILE: ${{ github.workspace }}/cookies.txt
           GEMINI_MODEL: gemini-3.5-flash-lite
           WHISPER_MODEL: small
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python3 scripts/make_shorts.py
 
