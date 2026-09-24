@@ -51,7 +51,7 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -U "yt-dlp[default]"
-          python3 -m pip install faster-whisper opencv-python-headless mediapipe numpy
+          python3 -m pip install faster-whisper opencv-python-headless numpy
 
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
